@@ -1,19 +1,5 @@
 # custom_nodes/wan_resolution_helper.py
-# WAN 2.2 Image→Video: Resolution Helper (16x) — Profile-based, adaptive caps
-#
-# WHAT'S NEW (vs previous):
-# - "Profile" dropdown: Highest Quality (slowest), Balanced (regular), Speed (fastest), Custom
-# - Adaptive cap selection: picks a cap from a profile "ladder" CLOSEST to the image's long side,
-#   respecting per-profile upscale limits and a global 1280 cap (Custom can exceed 1280).
-# - Extreme aspect ratio handling: safeguards against overly tiny short sides; will switch to a
-#   short-side-first strategy if needed.
-# - Tooltips/hover help for every control (supported in recent ComfyUI; if your build ignores
-#   tooltips, it won’t break anything).
-#
-# OUTPUTS:
-# - width_out (INT), height_out (INT): pass straight to a Resize node
-# - info (STRING): readable summary of what was chosen and why
-# - profile_note (STRING): short explainer of the selected profile
+# WAN 2.2 Image→Video: Resolution Helper (16x) — Profiles, Downscale-only, AR output
 
 from __future__ import annotations
 from typing import Dict, Any, Tuple, List, Optional
@@ -26,7 +12,6 @@ CATEGORY = "WAN/Resolution"
 # -----------------------------
 
 PROFILES = [
-    # (key, display name)
     ("highest_quality", "Highest Quality (slowest)"),
     ("balanced", "Balanced (regular)"),
     ("speed", "Speed (fastest)"),
@@ -36,52 +21,47 @@ PROFILES = [
 PROFILE_HELP: Dict[str, str] = {
     "highest_quality": (
         "Targets up to 1280 on the long side (divisible by 16). Adaptive: picks the closest sensible cap "
-        "to your image's long side without exceeding a ~2.0× upscale. Enforces a minimum short side ≈512 "
-        "via fallback if the aspect ratio is extreme."
+        "to your image's long side. Enforces a minimum short side ≈512 via fallback if the aspect ratio is extreme. "
+        "Strictly downscale-only (never upsizes)."
     ),
     "balanced": (
-        "Targets ~1024/960/896 on the long side. Adaptive: chooses the closest sensible cap without exceeding "
-        "a ~1.5× upscale. Minimum short side ≈448 with fallback for extreme ratios."
+        "Targets ~1024/960/896 on the long side (never above 1024). Adaptive: chooses the closest sensible cap. "
+        "Minimum short side ≈448 with fallback for extreme ratios. Strictly downscale-only."
     ),
     "speed": (
-        "Targets ~896/832/768/704/640 on the long side. Adaptive: chooses the closest sensible cap without "
-        "exceeding ~1.25× upscale. Minimum short side ≈384 with fallback for extreme ratios—best for previews."
+        "Targets ~896/832/768/704/640 on the long side (never above 896). Adaptive: chooses the closest sensible cap. "
+        "Minimum short side ≈384 with fallback for extreme ratios—best for previews. Strictly downscale-only."
     ),
     "custom": (
-        "You set the max side. Can exceed 1280 if desired. Still snaps both sides to multiples of 16 and preserves "
-        "aspect ratio. Extreme-AR fallback applies if enabled."
+        "You set the long-side cap. Can exceed 1280 if desired. Preserves aspect ratio and snaps both sides to multiples "
+        "of 16. Always downscales toward your target (won’t upscale). Extreme-AR fallback applies if enabled."
     ),
 }
 
 # Per-profile configuration:
-# - ladder: candidate long-side caps (will add the snapped original long side as another candidate)
-# - max_upscale: do not upscale beyond this factor (relative to original long side)
-# - min_short: target minimum short side (after scaling) to avoid brittle thin sides
+# - ladder: candidate long-side caps (we may add the snapped original for non-Custom)
+# - min_short: target minimum short side after scaling (extreme-AR safeguard)
 # - global_cap: maximum allowed cap (None = unlimited)
 PROFILE_CFG = {
     "highest_quality": {
         "ladder": [1280, 1152, 1088, 1024, 960],
-        "max_upscale": 2.0,
         "min_short": 512,
         "global_cap": 1280,
     },
     "balanced": {
         "ladder": [1024, 960, 896],
-        "max_upscale": 1.5,
         "min_short": 448,
-        "global_cap": 1280,
+        "global_cap": 1024,  # never exceed 1024
     },
     "speed": {
         "ladder": [896, 832, 768, 704, 640],
-        "max_upscale": 1.25,
         "min_short": 384,
-        "global_cap": 1280,
+        "global_cap": 896,   # never exceed 896
     },
     "custom": {
-        "ladder": [],  # filled at runtime with [custom_max_side]
-        "max_upscale": None,  # no extra limits beyond scale_behavior
-        "min_short": 384,     # still keep a gentle floor for extreme AR unless disabled
-        "global_cap": None,   # no hard cap unless user’s custom value acts as one
+        "ladder": [],        # filled with the user target at runtime
+        "min_short": 384,
+        "global_cap": None,  # no hard cap beyond user input
     },
 }
 
@@ -92,16 +72,6 @@ ROUNDING_HELP = (
     "• ceil: always round up to the next higher multiple of 16"
 )
 
-SCALE_BEHAVIOR_CHOICES = [
-    ("scale_to_target", "Scale to target (up/down)"),
-    ("downscale_only", "Downscale only"),
-]
-
-SCALE_BEHAVIOR_HELP = (
-    "Scale to target: the long side may be up- or down-scaled (subject to the profile’s upscale limit).\n"
-    "Downscale only: never upscale; the target cap acts as a ceiling only."
-)
-
 EXTREME_AR_HELP = (
     "When the image is very tall or wide, the computed short side could get too small. "
     "With this ON, the node will switch to a short-side-first strategy (with sensible floors) "
@@ -110,7 +80,7 @@ EXTREME_AR_HELP = (
 
 CUSTOM_MAX_SIDE_HELP = (
     "Only used when Profile = Custom. Sets the desired long-side cap (divisible by 16). "
-    "Can exceed 1280 if your pipeline/VRAM allows."
+    "The node will only downscale toward this value (never upscale)."
 )
 
 # -----------------------------
@@ -137,99 +107,105 @@ def _snap16(n: float, mode: str = "nearest", cap: Optional[int] = None) -> int:
         out = cap if cap % 16 == 0 else (cap // 16) * 16
     return out
 
+def _gcd(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return max(1, a)
+
+def _ratio_str(w: int, h: int) -> str:
+    g = _gcd(w, h)
+    return f"{w // g}:{h // g}"
+
 def _build_candidates(
     profile_key: str,
     L: int,
     custom_max_side: Optional[int],
-    include_snapped_original: bool,
+    include_snapped_original_for_non_custom: bool,
 ) -> List[int]:
     cfg = PROFILE_CFG[profile_key]
     ladder = list(cfg["ladder"])
+
     if profile_key == "custom":
+        # For Custom, ONLY use the user target (we will downscale toward it).
         if custom_max_side is None or custom_max_side < 16:
             ladder = [1280]  # safe default if user forgot to set
         else:
             ladder = [int(custom_max_side)]
-    # Always consider the snapped original long side (it respects the native scale)
-    if include_snapped_original:
-        ladder.append(_snap16(L, mode="nearest"))
-    # Deduplicate and sort descending (we want to gravitate to larger caps first)
+    else:
+        # For non-Custom, we may include the snapped original long side (downscale-only will filter > L).
+        if include_snapped_original_for_non_custom:
+            ladder.append(_snap16(L, mode="nearest"))
+
+    # Deduplicate and sort descending (prefer larger caps if equally close but ≤ L)
     uniq = sorted({int(x) for x in ladder if x >= 16}, reverse=True)
     return uniq
 
-def _pick_cap_for_profile(
+def _pick_cap_downscale_only(
     profile_key: str,
     L: int,
-    S: int,
     rounding_mode: str,
-    scale_behavior: str,
     custom_max_side: Optional[int],
 ) -> Tuple[int, Dict[str, Any]]:
     """
-    Returns (chosen_cap, debug_info)
+    Strictly downscale-only picker:
+      - Disallow any candidate > L (never upscale)
+      - Clamp to profile global cap (if any)
+      - For Custom: honor the user target (snapped & clamped to ≤ L)
+      - For others: pick the candidate closest to L (but ≤ L and ≤ global cap)
     """
     cfg = PROFILE_CFG[profile_key]
     global_cap = cfg["global_cap"]
-    max_upscale = cfg["max_upscale"]
-    min_short = cfg["min_short"]
 
-    candidates = _build_candidates(profile_key, L, custom_max_side, include_snapped_original=True)
+    # Build candidates
+    candidates = _build_candidates(
+        profile_key,
+        L,
+        custom_max_side,
+        include_snapped_original_for_non_custom=True,
+    )
 
-    # Apply global cap (except Custom where global_cap=None)
-    def clamp_global(cap: int) -> int:
+    # Helper to clamp to profile global cap
+    def clamp_to_cap(x: int) -> int:
         if global_cap is None:
-            return cap
-        return min(cap, global_cap)
+            return x
+        return min(x, global_cap)
 
-    # Filter candidates by scale behavior and upscale limit
+    # Downscale-only filter: clamp to cap, then reject > L
     filtered: List[int] = []
     for c in candidates:
-        c = clamp_global(c)
-        if scale_behavior == "downscale_only" and c > L:
-            continue
-        if max_upscale is not None and c > L * max_upscale:
-            continue
-        filtered.append(c)
+        c = clamp_to_cap(c)
+        if c <= L:
+            filtered.append(c)
 
+    # If nothing survived, fall back to min(L, global_cap)
     if not filtered:
-        # If everything filtered out, fall back to the safest option:
-        # - if downscale_only: use min(L, global_cap) snapped
-        # - else: allow the smallest candidate even if it violates upscale limit (as last resort)
-        if scale_behavior == "downscale_only":
-            fallback = _snap16(min(L, global_cap if global_cap else L), mode=rounding_mode)
-            return fallback, {
-                "reason": "fallback_downscale_only",
-                "candidates": candidates,
-                "filtered": filtered,
-            }
-        else:
-            # permit the closest candidate regardless of upscale limit (rare)
-            closest = min(candidates, key=lambda c: abs(c - L))
-            closest = clamp_global(closest)
-            return closest, {
-                "reason": "fallback_closest",
-                "candidates": candidates,
-                "filtered": filtered,
-            }
+        fallback = _snap16(min(L, global_cap if global_cap else L), mode=rounding_mode)
+        return fallback, {
+            "reason": "fallback_downscale_only",
+            "candidates": candidates,
+            "filtered": filtered,
+        }
 
-    # Choose the candidate closest to L
+    # Custom profile: pick the user target (snapped), not "closest to L"
+    if profile_key == "custom":
+        target = candidates[0]  # this is the user-specified cap from _build_candidates
+        target = clamp_to_cap(target)
+        # Enforce downscale-only: cannot exceed L
+        target = min(target, L)
+        target = _snap16(target, mode=rounding_mode, cap=global_cap)
+        return target, {
+            "reason": "custom_target_downscale_only",
+            "candidates": candidates,
+            "filtered": filtered,
+        }
+
+    # Non-Custom: choose candidate closest to L (all are ≤ L and ≤ cap)
     chosen = min(filtered, key=lambda c: abs(c - L))
     return chosen, {
-        "reason": "closest_to_input_long_side",
+        "reason": "closest_to_input_long_side_downscale_only",
         "candidates": candidates,
         "filtered": filtered,
     }
-
-def _short_side_fallback_targets(profile_key: str) -> List[int]:
-    """Short-side-first floors to consider when AR is extreme."""
-    cfg = PROFILE_CFG[profile_key]
-    base = max(16, int(cfg["min_short"]))
-    # Build a small, sensible ladder around that floor (descending)
-    ladder = sorted({base, base + 64, base + 128, base + 192, base + 256}, reverse=True)
-    # Make them multiples of 16
-    ladder = [_snap16(x, mode="nearest") for x in ladder]
-    ladder = sorted(set(ladder), reverse=True)
-    return ladder
 
 def _compute_scaled_dims_from_long(
     w: int, h: int, long_target: int, rounding_mode: str, cap: Optional[int]
@@ -262,7 +238,6 @@ def _compute_optimal(
     h: int,
     profile_key: str,
     rounding_mode: str,
-    scale_behavior: str,
     use_extreme_ar_handling: bool,
     custom_max_side: Optional[int],
 ) -> Tuple[int, int, Dict[str, Any]]:
@@ -275,8 +250,9 @@ def _compute_optimal(
     global_cap = cfg["global_cap"]
     min_short = cfg["min_short"]
 
-    chosen_cap, pick_info = _pick_cap_for_profile(
-        profile_key, L_in, S_in, rounding_mode, scale_behavior, custom_max_side
+    # Pick a long-side target with strict downscale-only logic
+    chosen_cap, pick_info = _pick_cap_downscale_only(
+        profile_key, L_in, rounding_mode, custom_max_side
     )
 
     cap16 = (chosen_cap // 16) * 16 if chosen_cap is not None else None
@@ -297,7 +273,6 @@ def _compute_optimal(
                 out_w, out_h = out_w2, out_h2
                 used_short_side_fallback = True
                 break
-        # if still not met, keep the best we got (out_w, out_h)
 
     info = {
         "input_w": w,
@@ -315,31 +290,37 @@ def _compute_optimal(
     }
     return out_w, out_h, info
 
+def _short_side_fallback_targets(profile_key: str) -> List[int]:
+    """Short-side-first floors to consider when AR is extreme."""
+    cfg = PROFILE_CFG[profile_key]
+    base = max(16, int(cfg["min_short"]))
+    ladder = sorted({base, base + 64, base + 128, base + 192, base + 256}, reverse=True)
+    ladder = [_snap16(x, mode="nearest") for x in ladder]
+    ladder = sorted(set(ladder), reverse=True)
+    return ladder
+
 # -----------------------------
 # ComfyUI Node
 # -----------------------------
 
 class WANResolutionHelperNodeV2:
     """
-    ComfyUI node:
-      Inputs:
-        - image (IMAGE)
-        - profile (CHOICE): Highest Quality / Balanced / Speed / Custom
-        - custom_max_side (INT): only used for Custom
-        - rounding_mode (CHOICE)
-        - scale_behavior (CHOICE): Scale to target / Downscale only
-        - extreme_ar_handling (BOOLEAN)
-      Outputs:
-        - width_out (INT), height_out (INT)
-        - info (STRING)        : detailed summary
-        - profile_note (STRING): short explainer for the chosen profile
+    Inputs:
+      - image (IMAGE)
+      - profile (CHOICE): Highest Quality / Balanced / Speed / Custom
+      - custom_max_side (INT): only used for Custom
+      - rounding_mode (CHOICE)
+      - extreme_ar_handling (BOOLEAN)
+    Outputs:
+      - width_out (INT), height_out (INT)
+      - aspect_ratio (STRING) : reduced ratio like 3:2, 1:1, 9:16
+      - info (STRING)         : detailed summary
+      - profile_note (STRING) : short explainer for the chosen profile
     """
 
     @classmethod
     def INPUT_TYPES(cls):
-        # Build profile choices for UI
         profile_labels = [label for key, label in PROFILES]
-        profile_keys = [key for key, _ in PROFILES]
 
         return {
             "required": {
@@ -350,10 +331,10 @@ class WANResolutionHelperNodeV2:
                         "default": "Highest Quality (slowest)",
                         "tooltip": (
                             "Choose a profile:\n"
-                            "• Highest Quality (slowest): aims near 1280, adaptive to your image, ≤~2.0× upscale\n"
-                            "• Balanced (regular): aims near 1024/960/896, ≤~1.5× upscale\n"
-                            "• Speed (fastest): aims near 896/832/768..., ≤~1.25× upscale\n"
-                            "• Custom: you set the cap (can exceed 1280)"
+                            "• Highest Quality (slowest): aims near 1280, strictly downscale-only\n"
+                            "• Balanced (regular): aims near 1024/960/896 (never above 1024)\n"
+                            "• Speed (fastest): aims near 896/832/768... (never above 896)\n"
+                            "• Custom: you set the cap; downscale-only"
                         ),
                     },
                 ),
@@ -371,10 +352,6 @@ class WANResolutionHelperNodeV2:
                     ["nearest", "floor", "ceil"],
                     {"default": "nearest", "tooltip": ROUNDING_HELP},
                 ),
-                "scale_behavior": (
-                    [label for _, label in SCALE_BEHAVIOR_CHOICES],
-                    {"default": "Scale to target (up/down)", "tooltip": SCALE_BEHAVIOR_HELP},
-                ),
                 "extreme_ar_handling": (
                     "BOOLEAN",
                     {"default": True, "tooltip": EXTREME_AR_HELP},
@@ -382,14 +359,12 @@ class WANResolutionHelperNodeV2:
             }
         }
 
-    RETURN_TYPES = ("INT", "INT", "STRING", "STRING")
-    RETURN_NAMES = ("width_out", "height_out", "info", "profile_note")
+    RETURN_TYPES = ("INT", "INT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("width_out", "height_out", "aspect_ratio", "info", "profile_note")
     FUNCTION = "compute"
     CATEGORY = CATEGORY
 
-    # Helper: map label -> key
     _PROFILE_LABEL_TO_KEY = {label: key for key, label in PROFILES}
-    _SCALE_LABEL_TO_KEY = {label: key for key, label in SCALE_BEHAVIOR_CHOICES}
 
     def compute(
         self,
@@ -397,14 +372,11 @@ class WANResolutionHelperNodeV2:
         profile,
         custom_max_side,
         rounding_mode,
-        scale_behavior,
         extreme_ar_handling,
     ):
-        import torch
+        import torch  # ComfyUI IMAGE is a torch.Tensor
 
-        # Map UI labels back to keys
         profile_key = self._PROFILE_LABEL_TO_KEY.get(profile, "balanced")
-        scale_key = self._SCALE_LABEL_TO_KEY.get(scale_behavior, "scale_to_target")
 
         # Pull width/height from image
         if image is None:
@@ -427,35 +399,32 @@ class WANResolutionHelperNodeV2:
             int(h),
             profile_key=profile_key,
             rounding_mode=str(rounding_mode),
-            scale_behavior=str(scale_key),
             use_extreme_ar_handling=bool(extreme_ar_handling),
             custom_max_side=int(custom_max_side) if profile_key == "custom" else None,
         )
 
-        # Build human-readable strings
         profile_note = PROFILE_HELP.get(profile_key, "")
         chosen = info.get("chosen_cap")
         cap16 = info.get("cap16")
         reason = info.get("pick_info", {}).get("reason")
 
+        # Aspect ratio text for the *input* (as requested)
+        ar_text = _ratio_str(int(w), int(h))
+
         summary_lines = [
-            f"Profile: {profile}  |  Rounding: {rounding_mode}  |  {scale_behavior}",
-            f"Input: {w}×{h} ({_label_orientation(w,h)})",
+            f"Profile: {profile}  |  Rounding: {rounding_mode}  |  Downscale-only",
+            f"Input: {w}×{h} ({_label_orientation(w,h)}), AR={ar_text}",
         ]
         if profile_key == "custom":
-            summary_lines.append(f"Custom cap requested: {custom_max_side}  |  cap16={cap16}")
+            summary_lines.append(f"Custom target: {custom_max_side}  |  cap16={cap16}")
         else:
             summary_lines.append(f"Chosen cap: {chosen}  (cap16={cap16}, reason={reason})")
-
-        summary_lines.append(
-            f"Output (16x): {out_w}×{out_h} → {_label_orientation(out_w,out_h)}"
-        )
+        summary_lines.append(f"Output (16x): {out_w}×{out_h} → {_label_orientation(out_w,out_h)}")
         if info.get("used_short_side_fallback"):
             summary_lines.append("Note: Extreme-AR fallback (short-side-first) was used to protect the short side.")
-
         info_str = "\n".join(summary_lines)
 
-        return (int(out_w), int(out_h), info_str, profile_note)
+        return (int(out_w), int(out_h), ar_text, info_str, profile_note)
 
 
 NODE_CLASS_MAPPINGS = {
